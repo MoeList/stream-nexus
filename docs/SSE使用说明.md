@@ -208,11 +208,43 @@ PushResult result = client.ssePush(PushRequest.builder()
 | `nexus.sse.admin.auth-enabled` | `true` | 是否开启管理页登录 |
 | `nexus.sse.admin.username` | `admin` | 管理页登录账号 |
 | `nexus.sse.admin.password` | `adminsse` | 管理页登录口令，**部署务必改掉** |
-| `nexus.sse.app-store-path` | `data/push-apps.json` | 推送应用台账落盘位置（相对模块根目录），重启后仍在 |
+| `nexus.sse.app-store-path` | `data/push-apps.json` | 推送应用台账位置（相对模块根目录）：**单机**=本地 JSON 文件；**集群**=仅首次迁移时的导入源，台账本体在 Redis |
 
 **三套鉴权互不干涉**：`auth-enabled` 管「谁能推」、`connect-auth-enabled` 管「谁能连」、`nexus.sse.admin.*` 管「谁能打开运维页面」。
 
-**推送应用不在这里配置**：内置默认应用 `test-demo` / `c3RyZWFtLW5leHVz`（白名单 `test`，开箱即用且**只读**：不可改、不可删），其余应用在管理页「推送应用」页签运行时增删改，改动落盘到 `nexus.sse.app-store-path`，**重启后仍在**。
+**推送应用不在这里配置**：内置默认应用 `test-demo` / `c3RyZWFtLW5leHVz`（白名单 `test`，开箱即用且**只读**：不可改、不可删），其余应用在管理页「推送应用」页签运行时增删改。单机模式写入 `nexus.sse.app-store-path` 指向的 JSON；集群模式写入 Redis Hash，任一节点改动都会广播，其他节点立即生效（广播丢失时由 `app-cache-ttl` 兜底），**重启后仍在**。
+
+### 集群模式（可选）
+
+默认单机：`nexus.sse.cluster.enabled=false`，不建任何 Redis 连接。开启后所有副本连同一个 Redis：
+
+- **jar 直接运行**：本地自建 `application-cluster.properties`（该文件已在 `.gitignore` 中，不入库），放共享连接配置，节点身份逐个覆盖；
+- **Docker 部署**：不用激活 profile，直接用环境变量传开关与 Redis 地址，见「Docker 部署」。
+
+```bash
+java -jar nexus-sse-2.0.0.jar --spring.profiles.active=cluster \
+  --server.port=18088 --nexus.sse.cluster.node-id=node-1 --nexus.sse.cluster.node-seq=1
+```
+
+| 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `nexus.sse.cluster.enabled` | `false` | 集群总开关；关闭时进程行为与单机版本完全一致 |
+| `nexus.sse.cluster.node-id` | 空 | 节点唯一标识，留空按 `host:port` 兜底；容器部署必须显式配，否则副本互相覆盖 |
+| `nexus.sse.cluster.node-seq` | 空 | 雪花 ID 的节点位（0~4095），集群内唯一；留空按 nodeId 哈希推导，生产建议显式配 |
+| `nexus.sse.cluster.key-prefix` | `nexus:sse` | Redis Key / 频道命名空间，所有节点必须一致；同库跑 WebSocket 时用 `nexus:ws` 区分 |
+| `nexus.sse.cluster.node-heartbeat-interval` | `5s` | 节点心跳续期间隔 |
+| `nexus.sse.cluster.node-timeout` | `30s` | 超过该时间未续期即判定节点离线 |
+| `nexus.sse.cluster.admin-timeout` | `500ms` | 管理页聚合全集群连接列表的等待上限；超时返回已收到部分并标记 `partial=true` |
+| `nexus.sse.cluster.snapshot-ttl` | `60s` | 快照回复 List 的 TTL，防止发起方崩溃后留下垃圾 Key |
+| `nexus.sse.cluster.app-cache-ttl` | `30s` | 应用台账本地缓存的兜底刷新间隔；正常改动走广播，立即生效 |
+| `nexus.sse.cluster.apps-import-on-startup` | `false` | 首次从单机迁移到集群时，把本地 `push-apps.json` 导入 Redis（只开一次） |
+| `nexus.sse.cluster.max-message-bytes` | `1048576` | 单条广播消息上限，超限在入口节点直接拒绝，避免打爆订阅端内存 |
+| `nexus.sse.cluster.redis-protocol` | 驱动默认 | Redis 6 以下（如 3.0.5）必须设为 `resp2`，否则订阅握手超时 |
+| `spring.session.timeout` | `30m` | 管理页会话空闲过期时间；集群模式写进 Redis 会话，单机由容器 session 超时管理 |
+
+**管理与台账都是集群级**：管理页一次请求拿到全集群连接（每条标注所在节点，超时 partial）、推送应用台账在 Redis 共享，任一节点增删改其他节点立即生效。
+
+**登录态也是集群级**：集群模式的管理页 session 走 Spring Session Redis（非索引仓库，一个会话一个 Hash，键空间 `{key-prefix}:session`），任一节点登录后其他节点直接可用，登出对所有节点立即生效；Cookie 名仍是 `NEXUS_SSE_SESSIONID`，与单机一致。单机模式继续用容器内存 session，不依赖 Redis。
 
 ---
 
@@ -236,24 +268,70 @@ Docker 相关文件都在 `nexus-sse/` 下，命令在 `nexus-sse/` 目录里执
 ```bash
 cd nexus-sse
 
-# 方式一：编排（推荐，会先构建再启动）
+# 方式一：先构建镜像再启动（推荐，构建脚本只保留 latest）
+./scripts/docker-build.sh        # Windows: scripts\docker-build.cmd
+docker compose up -d
+
+# 方式二：一步构建并启动
 docker compose up -d --build
 
-# 方式二：先打镜像再跑
-./scripts/docker-build.sh       # Windows: scripts\docker-build.cmd
-docker run -d --name nexus-sse -p 8088:8088 simonking/nexus-sse:1.0.0
+# 方式三：不用编排，直接跑镜像
+docker run -d --name nexus-sse -p 8088:8088 \
+  -v "$(pwd)/data:/app/data" \
+  simonking/nexus-sse:latest
 
-docker compose logs -f          # 看日志
-docker compose down             # 停掉
+docker compose logs -f           # 看日志
+docker compose down              # 停掉
 ```
 
-要点：
+### 运行模式：默认单机，配了 Redis 才是集群
+
+Redis 连接信息一律在启动时用环境变量指定，编排文件里不写死任何地址：
+
+```bash
+# 单机（默认，不传任何参数，不建立 Redis 连接）
+docker compose up -d
+
+# 集群 — Redis Cluster（PowerShell）
+$env:NEXUS_SSE_CLUSTER_ENABLED="true"
+$env:REDIS_CLUSTER_NODES="127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002"
+$env:NODE_ID="node-1"; $env:NODE_SEQ="1"
+$env:REDIS_PROTOCOL="resp2"      # Redis 6 以下必须 resp2
+docker compose up -d
+
+# 集群 — 单节点 Redis
+$env:NEXUS_SSE_CLUSTER_ENABLED="true"
+$env:REDIS_HOST="127.0.0.1"; $env:REDIS_PORT="6379"
+docker compose up -d
+```
+
+| 启动参数 | 作用 | 不传时 |
+| --- | --- | --- |
+| `NEXUS_SSE_CLUSTER_ENABLED` | 运行模式开关，只接受 `true` / `false` | `false`（单机） |
+| `REDIS_CLUSTER_NODES` | Redis Cluster 种子节点，逗号分隔 | 空 |
+| `REDIS_HOST` / `REDIS_PORT` | 单节点 Redis 地址 | `127.0.0.1` / `6379`（单机模式不连接） |
+| `REDIS_PASSWORD` | Redis 口令 | 空 |
+| `REDIS_PROTOCOL` | `resp3`（默认）/ `resp2`（Redis < 6） | `resp3` |
+| `NODE_ID` / `NODE_SEQ` | 集群内唯一的节点身份 / 雪花节点位 | 代码按 host-port 与哈希兜底，多副本务必显式传 |
+| `KEY_PREFIX` | Key / Channel 命名空间 | `nexus:sse` |
+| `APPS_IMPORT_ON_STARTUP` | 单机台账首次导入 Redis，只开一次 | `false` |
+
+容器启动前会做一次前置校验（`docker-compose.yml` 的 `entrypoint`）：
+
+- 开关为空 → 归一化为 `false`；
+- 开关不是 `true` / `false` → 打印提示并 `exit 1`；
+- 开关为 `true` 但 `REDIS_CLUSTER_NODES` 与 `REDIS_HOST` 都没传 → 打印提示并 `exit 1`。
+
+> 多副本不要用 `container_name` + 固定端口去 `--scale`（会冲突）；每个副本用不同的 `NODE_ID` / `NODE_SEQ` 与宿主机端口分别启动。
+
+### 构建要点
 
 - **多阶段构建**：`maven:3.9-eclipse-temurin-17` 负责打包，`eclipse-temurin:17-jre-jammy` 只跑 JRE，最终镜像不含 Maven 与源码。
 - **Dockerfile 在模块内，构建上下文仍是仓库根目录**：`nexus-sse` 的父 POM 在根目录且依赖 `nexus-common`，所以脚本与 `docker-compose.yml` 都用 `-f nexus-sse/Dockerfile` + `context: ..` 的方式构建；不要在 `nexus-sse/` 下直接 `docker build .`。
-- **非 root 运行**（uid 1000）、`exec java` 保证 1 号进程能收到 SIGTERM 优雅停机。
-- **配置用环境变量覆盖**（Spring 宽松绑定）：`NEXUS_SSE_CONNECT_AUTH_ENABLED`、`NEXUS_SSE_HEARTBEAT_INTERVAL`、`SERVER_PORT` 等，见 `nexus-sse/docker-compose.yml`。
-- 改版本号时同步 `nexus-sse/Dockerfile` 的 `ARG JAR_VERSION`。
+- **容器内创建了 `nexus`（uid 1000）用户，但默认仍以 root 运行**（便于挂载卷落盘）；需要非 root 时在 Dockerfile 末尾加 `USER nexus`，并确保 `/app/data` 可写。
+- `exec java` 保证 java 是 1 号进程，能收到 SIGTERM 优雅停机。
+- **配置用环境变量覆盖**（Spring 宽松绑定）：`SERVER_PORT`、`NEXUS_SSE_HEARTBEAT_INTERVAL`、`NEXUS_SSE_CLUSTER_ENABLED`、`REDIS_CLUSTER_NODES` 等，完整清单见 `nexus-sse/docker-compose.yml`。
+- 改版本号时同步 `nexus-sse/Dockerfile` 的 `ARG JAR_VERSION`（当前 `2.0.0`，需与 `nexus-sse/pom.xml` 一致）。
 - `.dockerignore` 必须留在仓库根目录（构建上下文根）。
 - 反向代理下必须关闭缓冲，否则 SSE 消息会攒在缓冲区不下发。
 
@@ -307,7 +385,7 @@ curl -X DELETE http://localhost:8088/sse/admin/apps/{appId}
 
 | 限制 | 影响 | 演进方向 |
 | --- | --- | --- |
-| 单节点 | 连接表在内存，无法水平扩展 | 连接表外置 + 跨节点广播 |
+| 集群规模 | 连接表仍在各节点内存，管理页靠快照聚合（有节点超时则 `partial`）；推送为全网扇出，节点越多重复投递越多 | 连接归属索引 + 定向路由 |
 | 无消息历史 | 断线期间的消息一定丢，需 `onopen` 重拉全量 | 引入 Redis 后按 `Last-Event-ID` 补发 |
 | ApiKey 明文 | 密钥可被日志落盘、请求可重放 | HMAC 签名 + nonce + 时间窗 |
 | 订阅/心跳应答无鉴权 | 任何人可订阅任意模块 | JWT 订阅票据 |

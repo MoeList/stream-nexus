@@ -10,7 +10,7 @@
     </parent>
     <groupId>com.simonking.nexus</groupId>
     <artifactId>nexus-websocket</artifactId>
-    <version>1.0.0</version>
+    <version>2.0.0</version>
     <name>nexus-websocket</name>
     <description>nexus-websocket：独立部署的 WebSocket 推送服务（WebSocket 建连 + REST 推送入口）</description>
 
@@ -23,6 +23,23 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-thymeleaf</artifactId>
+        </dependency>
+
+        <!-- 集群模式的跨节点总线。单机模式（nexus.ws.cluster.enabled=false）
+             不会创建任何 Redis 连接，也不要求本机有 Redis；依赖存在只是让
+             RedisWsBroadcaster 能编译并按条件装配 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!-- 集群模式的管理页登录态共享（Spring Session Redis）。
+             依赖存在不等于启用：启动类排除 SessionDataRedisAutoConfiguration，
+             且只有 WsSessionConfig（cluster.enabled=true）才声明 RedisSessionRepository；
+             单机继续用容器内存 session，不需要 Redis -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-session-data-redis</artifactId>
         </dependency>
 
         <dependency>

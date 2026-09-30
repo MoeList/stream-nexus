@@ -39,4 +39,24 @@ public class SseSender {
                 .data(jsonMapper.writeValueAsString(message), MediaType.APPLICATION_JSON);
         client.getEmitter().send(builder);
     }
+
+    /**
+     * 发送已经序列化好的消息 JSON
+     *
+     * <p>集群消费端拿到的 {@code ClusterMessage.message} 就是完整 JSON，
+     * 直接写 SSE 即可：不再反序列化成对象再序列化，既保留原始类型，也省一次转换。
+     *
+     * @param event     SSE 事件名（{@code MESSAGE} / {@code PING} 等）
+     * @param messageId 消息ID，可为空（心跳消息不带 id）
+     * @param json      完整 {@link NexusMessage} JSON
+     */
+    public void sendRaw(SseClient client, String event, String messageId, String json) throws IOException {
+        SseEmitter.SseEventBuilder builder = SseEmitter.event();
+        if (messageId != null && !messageId.isBlank()) {
+            builder.id(messageId);
+        }
+        String eventName = (event == null || event.isBlank()) ? SseEvent.MESSAGE.name() : event;
+        builder.name(eventName).data(json, MediaType.APPLICATION_JSON);
+        client.getEmitter().send(builder);
+    }
 }

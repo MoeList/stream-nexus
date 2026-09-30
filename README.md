@@ -14,7 +14,8 @@
 </p>
 
 <p align="center">
-零中间件依赖（无 Redis / MQ / 数据库），全内存运行，独立部署，与业务进程解耦。
+单机零中间件依赖（无 Redis / MQ / 数据库），全内存运行，独立部署，与业务进程解耦；
+SSE 与 WebSocket 均支持可选的 Redis 集群模式（跨节点推送 + 节点台账 + 登录态共享）。
 </p>
 
 ---
@@ -38,25 +39,25 @@
 | 长连接订阅 | SSE `GET /sse/subscribe`、WebSocket `ws://host:9090/ws?modules=xxx`；连接永不过期，一条连接可同时订阅多个业务模块 |
 | 双寻址推送 | 按 `bizModule` 广播、按 `clientId` 定向，两者可同时使用（命中并集、按连接去重） |
 | 全局模块 `*` | 订阅侧默认值；推 `*` = 广播给全部在线连接；推其它模块时订阅 `*` 的连接同样会收到 |
-| 全局跨域 | `WebMvcConfigurer#addCorsMappings` 注册 `/**`，源 / 方法 / 头 / 凭证全量放行，无需配置 |
+| 终端接入面跨域 | `WebMvcConfigurer#addCorsMappings` 只对 `/sse/subscribe`、`/sse/pong`、`/sse/push` 开放；运维接口 `/sse/admin/**` 保持同源，避免明文 apiKey 被跨站读取 |
 | 心跳保活 | 服务端每 15s 下发 `PING`，客户端回 `PONG`，压制 LB / NAT 空闲断链 |
 | 死连接回收 | 四条判据（回调 / 心跳超时 / 软重置 / 写入失败）统一回收，避免半开连接堆积 |
 | 推送鉴权 | `X-Sse-AppId` + `X-Sse-Key` / `X-Ws-AppId` + `X-Ws-Key` 配对校验，并按应用限制模块白名单 |
-| 运维接口 | 在线连接查询与强制下线；推送应用 `appId`/`key` 的运行时增删（SSE 落盘，WebSocket 仅内存） |
+| 运维接口 | 在线连接查询与强制下线；推送应用 `appId`/`key` 的运行时增删（单机落本地 JSON，集群存 Redis Hash 多节点共享） |
 | 内置页面 | `/admin` 连接台账 + 应用管理，`/console` 推送测试页 |
 | 自定义连接测试 | `/console` 测试页自带「自定义连接地址」模式：默认走系统地址（自动拼接订阅模块与建连令牌），切到自定义后直接填**外部 SSE / WebSocket 链接**、点「连接」即以输入框地址建连，用来测外部流式服务；外部服务不认本服务的模块订阅与建连令牌，切到自定义后这些输入框一并隐藏。SSE 侧另有「监听事件」标签（`MESSAGE` / `message` / 自定义事件名），兼容不带事件名的外部 SSE 流 |
 | 管理页登录 | **两个服务各有独立的一套 session 登录**：SSE 的 `/admin`、`/console` 与 `/sse/admin/**` 需登录，默认 `admin` / `adminsse`（`nexus.sse.admin.*`）；WebSocket 的 `/admin`、`/console` 与 `/ws/admin/**` 同样需登录，默认 `admin` / `adminws`（`nexus.ws.admin.*`）。未登录时页面 302 到 `/login`（带回跳地址）、接口返回 401 JSON；两边 session Cookie 名不同（`NEXUS_SSE_SESSIONID` / `NEXUS_WS_SESSIONID`），两个服务同跑一台机器时可同时登录、互不踢线 |
 
 > 管理页登录是**第三套鉴权**：与「谁能推」（`auth-enabled`）「谁能连」（`connect-auth-enabled`）互不干涉，只守运维入口——
 > 终端建连 `ws://host:9090/ws` 与推送接口 `/sse/push`、`/ws/push` 都**不经过它**，接入方调用链不受影响。
-> 定位是「内网运维页不裸奔」的单共享账号（明文口令 + 内存态 session），部署请改掉默认口令并限制内网访问；
+> 定位是「内网运维页不裸奔」的单共享账号（明文口令 + 单机内存 session / 集群 Spring Session Redis），部署请改掉默认口令并限制内网访问；
 > 确需退回无登录，把 `nexus.sse.admin.auth-enabled` / `nexus.ws.admin.auth-enabled` 置为 `false` 即可。
 
 ---
 
 ## 设计优势
 
-1. **零中间件**：连接表与消息 ID 全在内存，不需要 Redis / MQ，单机 `java -jar` 即可跑，接入成本极低。
+1. **单机零中间件**：连接表与消息 ID 全在内存，不需要 Redis / MQ，单机 `java -jar` 即可跑；需要多节点时再打开可选的 Redis 集群模式。
 2. **双通道互补**：SSE 走 HTTP 生态、单向、浏览器原生自动重连；WebSocket 走全双工、可上行、适合高频交互。两套协议与端口完全独立，按终端类型各取所需，可同时部署。
 3. **Netty 与 Spring MVC 同进程共享注册表**：`nexus-websocket` 一个进程内，Netty（9090 收终端 / 9091 收业务系统）与 Spring MVC（8089 收 REST 推送）共享同一张连接注册表，REST / TCP 收到消息后直接写 WebSocket 通道，**零跨进程转发、零网络跳转**。
 4. **双推送入口**：REST 短连接一次 POST 同步拿回执（`total / success / failed`，推没推到人当场知道）；TCP 长连接一条连接一直推，省掉高频场景反复重建 HTTP 连接与重复鉴权的开销，还自带心跳提前发现链路中断。
@@ -92,8 +93,8 @@ mvn -pl nexus-websocket -am spring-boot:run
 Windows 下把 `mvn` 换成 `mvnw.cmd` 即可；也可直接运行 jar：
 
 ```bash
-java -jar nexus-sse/target/nexus-sse-1.0.0.jar
-java -jar nexus-websocket/target/nexus-websocket-1.0.0.jar
+java -jar nexus-sse/target/nexus-sse-2.0.0.jar
+java -jar nexus-websocket/target/nexus-websocket-2.0.0.jar
 ```
 
 > 两个服务各占一个端口、各一张连接注册表、各一张推送应用表，完全独立，可同时部署。
@@ -171,6 +172,10 @@ services:
       NEXUS_WS_HEARTBEAT_INTERVAL: 15s
       NEXUS_WS_HEARTBEAT_TIMEOUT: 90s
       NEXUS_WS_AUTH_ENABLED: "true"
+      NEXUS_WS_ADMIN_AUTH_ENABLED: "true"
+      NEXUS_WS_ADMIN_USERNAME: "admin"
+      NEXUS_WS_ADMIN_PASSWORD: "adminws"
+      NEXUS_WS_APP_STORE_PATH: "/app/data/push-apps.json"
 ```
 
 也可以先打镜像再单跑：
@@ -196,10 +201,83 @@ docker run -d --name nexus-websocket -p 8089:8089 -p 9090:9090 -p 9091:9091 \
 - **构建上下文是仓库根目录**：两个模块的父 POM 在根目录且都依赖 `nexus-common`，所以编排里是 `context: ..` + `dockerfile: nexus-xxx/Dockerfile`；**不要在模块目录下直接 `docker build .`**。
 - **多阶段构建**：Maven 镜像负责打包，JRE 镜像只跑运行时，最终镜像不含 Maven 与源码；容器以 **root** 运行（未切 `USER`），`exec java` 保证 1 号进程能收到 SIGTERM 优雅停机。
 - **镜像标签用 `latest`**：编排与脚本都打 `simonking/nexus-sse:latest`、`simonking/nexus-websocket:latest`，本地起服务直接用 `docker compose up -d --build`。
-- **台账落盘**：两个服务的推送应用台账都写到容器内 `/app/data/push-apps.json`，编排里挂到宿主机 `./data`；删掉该目录等于清空新增的应用，备份 / 迁移直接拷目录。
+- **台账落盘**：单机模式两个服务的推送应用台账都写到容器内 `/app/data/push-apps.json`，编排里挂到宿主机 `./data`；集群模式改存 Redis Hash（多节点共享），文件只在 `apps-import-on-startup=true` 时导入一次。
 - **配置一律用环境变量覆盖**（Spring 宽松绑定）：`nexus.sse.heartbeat-interval` → `NEXUS_SSE_HEARTBEAT_INTERVAL`，`nexus.ws.tcp-port` → `NEXUS_WS_TCP_PORT`。
 - **反向代理**：SSE 必须关掉 `proxy_buffering`；WebSocket 必须带上 `Upgrade` / `Connection` 头且 `proxy_read_timeout` 大于心跳间隔；9091 是裸 TCP（非 HTTP），反向代理无法按路径转发，需四层转发（`stream` 模块）或直连。
 - 编排里的令牌是明文示例，生产请用 docker secret / 外部 env 文件挂载；改版本号时同步 `Dockerfile` 的 `ARG JAR_VERSION`。
+
+### 集群模式（可选）
+
+两个服务默认都是单机（`cluster.enabled=false`），不建立任何 Redis 连接。多节点部署时分别打开，
+集群能力一一对应，**Key 前缀必须区分**（`nexus:sse` / `nexus:ws`），否则两个服务会互相消费广播、会话 Key 也会撞。
+
+#### SSE
+
+```properties
+nexus.sse.cluster.enabled=true
+nexus.sse.cluster.node-id=node-1          # 每个节点唯一
+nexus.sse.cluster.node-seq=1              # 0~4095，每个节点唯一
+nexus.sse.cluster.key-prefix=nexus:sse
+spring.data.redis.host=127.0.0.1
+spring.data.redis.port=6379
+# Redis Cluster 用这一组，不要再配 host/port：
+# spring.data.redis.cluster.nodes=127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002
+```
+
+| 能力 | 实现 |
+| --- | --- |
+| 跨节点推送 | Redis Pub/Sub `{key-prefix}:bus:push`；入口节点发布后各节点本地扇出，按 `originNodeId` 跳过回环 |
+| 节点注册 | Hash `{key-prefix}:nodes`，每 5s 续期，30s 未续期判定下线并清理连接归属 |
+| 连接归属 | Hash `{key-prefix}:owners`；PONG 落到非持有节点时按 `clientId` 定向转发 |
+| 应用台账 | Hash `{key-prefix}:apps` + 版本号；改动广播 `APPS_CHANGED`，其他节点立即重载 |
+| 管理页登录态 | Spring Session Redis，键空间 `{key-prefix}:session`；任一节点登录全集群可用 |
+
+#### WebSocket
+
+```properties
+nexus.ws.cluster.enabled=true
+nexus.ws.cluster.node-id=node-1          # 每个节点唯一
+nexus.ws.cluster.node-seq=1              # 0~4095，每个节点唯一
+nexus.ws.cluster.key-prefix=nexus:ws
+# Redis 3.x / 只支持 RESP2 的代理必须显式降级，否则订阅注册超时
+nexus.ws.cluster.redis-protocol=resp2
+spring.data.redis.host=127.0.0.1
+spring.data.redis.port=6379
+# Redis Cluster 用这一组，不要再配 host/port：
+# spring.data.redis.cluster.nodes=127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002
+```
+
+| 能力 | 实现 |
+| --- | --- |
+| 跨节点推送 | Redis Pub/Sub `{key-prefix}:bus:push`；REST 与 TCP 收到的消息都经总线扇出，按 `originNodeId` 跳过回环 |
+| 节点注册 | Hash `{key-prefix}:nodes`，每 5s 续期；启动做 nodeId / nodeSeq 唯一性校验，冲突直接拒绝启动 |
+| 应用台账 | Hash `{key-prefix}:apps` + `:apps:version`；改动广播 `APPS_CHANGED`，其他节点立即重载 |
+| 连接台账 | 管理页按「请求-回复」向各节点收集快照（`SNAPSHOT_REQUEST` → Redis List），超时返回 `partial=true` + 缺失节点 |
+| 踢下线 | `KICK` / `KICK_ALL` 控制消息广播，命中节点本地关闭连接 |
+| 管理页登录态 | Spring Session Redis，键空间 `{key-prefix}:session`；任一节点登录全集群可用 |
+
+Docker 部署不用改镜像，用环境变量打开（编排的 entrypoint 会先校验开关与 Redis 地址）：
+
+```bash
+cd nexus-websocket
+NEXUS_WS_CLUSTER_ENABLED=true \
+REDIS_CLUSTER_NODES=127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 \
+NODE_ID=ws-node-1 NODE_SEQ=1 REDIS_PROTOCOL=resp2 \
+docker compose up -d
+```
+
+jar 直接启动则在 `nexus-websocket/src/main/resources/` 下自建 `application-cluster.properties`
+（已加入 `.gitignore`，只放共享的 Redis 地址），用 `--spring.profiles.active=cluster` 激活，
+每个副本再用命令行覆盖端口与 node-id / node-seq。
+
+注意事项：
+
+- `node-id` 与 `node-seq` 必须集群内唯一：启动时会做唯一性校验，宁可起不来也不让两个节点撞消息 ID。
+- 首次从单机迁移时，把对应的 `cluster.apps-import-on-startup=true` 开一次，把本地 `push-apps.json` 导入 Redis 台账（只开一次）。
+- **集群模式是失败关闭的**：开关打开但 Redis 连不上，进程直接启动失败（exit 1），不会静默退回单机。
+- Redis 3.x 或只支持 RESP2 的代理必须配 `redis-protocol=resp2`，否则启动报 `Subscription registration timeout exceeded`。
+- 多副本部署时，每个副本的 `server.port` / `ws-port` / `tcp-port`（WebSocket）必须错开，并显式传 node-id / node-seq。
+- Redis Cluster 下登录会先作废旧会话，避免 `RENAME` 跨 hash slot 报 `CROSSSLOT`。
 
 ### 效果示例
 
@@ -251,8 +329,8 @@ WebSocket 通道（`nexus-websocket`，端口 8089）开箱自带两个页面，
 ```java
 // 1. 构造：两个服务各一组「地址 + 鉴权」，用哪个填哪个（只推 SSE 就可以不写 ws*）
 NexusRestClient client = NexusRestClient.builder()
-        .sseBaseUrl("http://10.0.0.8:8088").sseAppId("order-service").sseApiKey("sse-key")
-        .wsBaseUrl("http://10.0.0.8:8089").wsAppId("order-service").wsApiKey("ws-key")
+        .sseBaseUrl("http://127.0.0.1:8088").sseAppId("order-service").sseApiKey("sse-key")
+        .wsBaseUrl("http://127.0.0.1:8089").wsAppId("order-service").wsApiKey("ws-key")
         .build();
 
 // 2. 推：按终端类型挑方法，一次 HTTP POST，同步拿回执

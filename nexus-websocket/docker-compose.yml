@@ -10,6 +10,13 @@
 # 改端口同步改 SERVER_PORT / NEXUS_WS_WS_PORT / NEXUS_WS_TCP_PORT 与端口映射。
 # 配置项一律用环境变量覆盖（Spring 宽松绑定：
 # nexus.ws.connect-auth-enabled -> NEXUS_WS_CONNECT_AUTH_ENABLED）。
+#
+# ===== 运行模式规则 =====
+# 1. 开关 NEXUS_WS_CLUSTER_ENABLED 默认 false：单机，不建立任何 Redis 连接；
+# 2. 开关置 true 时必须提供 Redis 配置（REDIS_CLUSTER_NODES 或 REDIS_HOST 二选一），
+#    否则 entrypoint 直接报错退出，不会带着空配置启动；
+# 3. 开关只接受 true / false：空串或其它拼写会在启动时被拦下并给出明确提示
+#    （@ConditionalOnProperty 严格匹配，空串会让单机/集群两个广播实现都不装配）。
 
 services:
   nexus-websocket:
@@ -27,6 +34,38 @@ services:
     # 推送应用台账挂到宿主机：容器重建后新增的应用还在（不挂则随容器消失）
     volumes:
       - ./data:/app/data
+    # 启动前置校验（覆盖 Dockerfile 的 ENTRYPOINT，注意 $$ 是 compose 的转义）：
+    #   开关归一化 -> 集群模式必须带 Redis 参数 -> 才 exec java
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        case "$$NEXUS_WS_CLUSTER_ENABLED" in
+          "")
+            NEXUS_WS_CLUSTER_ENABLED=false
+            ;;
+          true|false)
+            ;;
+          *)
+            echo "[nexus-websocket] 启动失败：NEXUS_WS_CLUSTER_ENABLED 只接受 true / false，当前为 '$$NEXUS_WS_CLUSTER_ENABLED'" >&2
+            exit 1
+            ;;
+        esac
+        export NEXUS_WS_CLUSTER_ENABLED
+
+        if [ "$$NEXUS_WS_CLUSTER_ENABLED" = "true" ]; then
+          if [ -z "$$SPRING_DATA_REDIS_CLUSTER_NODES" ] && [ -z "$$REDIS_HOST" ]; then
+            echo "[nexus-websocket] 启动失败：已开启集群模式，但未指定 Redis 地址。" >&2
+            echo "  启动时二选一传入：" >&2
+            echo "    REDIS_CLUSTER_NODES=host1:7000,host2:7001,...   # Redis Cluster" >&2
+            echo "    REDIS_HOST=127.0.0.1 REDIS_PORT=6379           # 单节点 Redis" >&2
+            echo "  不需要集群时请去掉 NEXUS_WS_CLUSTER_ENABLED=true（默认即单机）。" >&2
+            exit 1
+          fi
+        fi
+
+        exec java $$JAVA_OPTS -jar /app/app.jar
     environment:
       TZ: Asia/Shanghai
       JAVA_OPTS: "-XX:MaxRAMPercentage=75"
@@ -49,8 +88,34 @@ services:
       NEXUS_WS_ADMIN_AUTH_ENABLED: "true"
       NEXUS_WS_ADMIN_USERNAME: "admin"
       NEXUS_WS_ADMIN_PASSWORD: "adminws"
-      # 推送应用台账落盘位置（容器内绝对路径，已挂到宿主机 ./data）
+      # 推送应用台账落盘位置（容器内绝对路径，已挂到宿主机 ./data）；
+      # 集群模式下台账改存 Redis Hash，这里的文件只在 apps-import-on-startup=true 时导入一次
       NEXUS_WS_APP_STORE_PATH: "/app/data/push-apps.json"
+
+      # ===== 运行模式：默认关闭（单机），开启即集群 =====
+      NEXUS_WS_CLUSTER_ENABLED: ${NEXUS_WS_CLUSTER_ENABLED:-false}
+      # 节点身份：集群内必须唯一；不传由代码用 host-ws-port 兜底，多副本请显式传
+      NEXUS_WS_CLUSTER_NODE_ID: ${NODE_ID:-}
+      NEXUS_WS_CLUSTER_NODE_SEQ: ${NODE_SEQ:-}
+      # Key / Channel 命名空间：与 SSE 共用同一个 Redis 时必须不同
+      NEXUS_WS_CLUSTER_KEY_PREFIX: ${KEY_PREFIX:-nexus:ws}
+      # Redis 3.x / 只支持 RESP2 的代理传 resp2，否则订阅注册超时报错
+      NEXUS_WS_CLUSTER_REDIS_PROTOCOL: ${REDIS_PROTOCOL:-resp3}
+      # 首次从单机迁到集群时传 true 跑一次：把 ./data/push-apps.json 导入 Redis
+      NEXUS_WS_CLUSTER_APPS_IMPORT_ON_STARTUP: ${APPS_IMPORT_ON_STARTUP:-false}
+
+      # ===== Redis 连接（启动时二选一传入，均不传即单机）=====
+      # 1) Redis Cluster：逗号分隔的种子节点；与下面的 host 同时传时以 cluster 为准
+      SPRING_DATA_REDIS_CLUSTER_NODES: ${REDIS_CLUSTER_NODES:-}
+      SPRING_DATA_REDIS_CLUSTER_MAX_REDIRECTS: ${REDIS_MAX_REDIRECTS:-3}
+      # 2) 单节点 Redis：给一个安全默认值，保证单机模式下连接工厂创建不受空 host 影响；
+      #    是否真的传了地址由下面的 REDIS_HOST 判断
+      SPRING_DATA_REDIS_HOST: ${REDIS_HOST:-127.0.0.1}
+      SPRING_DATA_REDIS_PORT: ${REDIS_PORT:-6379}
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      SPRING_DATA_REDIS_TIMEOUT: ${REDIS_TIMEOUT:-3s}
+      # 仅用于启动校验：用户是否显式传了单节点 Redis 地址
+      REDIS_HOST: ${REDIS_HOST:-}
 
 # 注意：
 # 1. 上面的令牌是明文示例，生产请用 docker secret / 外部 env 文件挂载，别提交真实口令。
@@ -59,3 +124,31 @@ services:
 #      proxy_set_header Connection "upgrade";
 #      proxy_read_timeout 3600s;   # 长连接别被代理层掐断
 # 3. 9091 TCP 是裸 TCP 长连接（非 HTTP），反向代理无法按路径转发，需走四层转发（stream 模块）或直连。
+# 4. 多副本：本编排只起一个实例。多实例请各自用独立端口映射，并显式传 NODE_ID / NODE_SEQ，
+#    否则唯一性校验会让第二个副本起不来。
+#
+# ===== 启动示例（参数只在当前 shell 生效，不落文件）=====
+# PowerShell 单机（什么都不用传）：
+#   docker compose up -d
+#
+# PowerShell 集群 — Redis Cluster（Redis 3.x 必须配 resp2）：
+#   $env:NEXUS_WS_CLUSTER_ENABLED="true"
+#   $env:REDIS_CLUSTER_NODES="127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002"
+#   $env:NODE_ID="ws-node-1"; $env:NODE_SEQ="1"
+#   $env:REDIS_PROTOCOL="resp2"
+#   docker compose up -d
+#
+# PowerShell 集群 — 单节点 Redis：
+#   $env:NEXUS_WS_CLUSTER_ENABLED="true"
+#   $env:REDIS_HOST="127.0.0.1"; $env:REDIS_PORT="6379"
+#   docker compose up -d
+#
+# Bash 一行式：
+#   NEXUS_WS_CLUSTER_ENABLED=true \
+#   REDIS_CLUSTER_NODES=127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002 \
+#   NODE_ID=ws-node-1 NODE_SEQ=1 REDIS_PROTOCOL=resp2 \
+#   docker compose up -d
+#
+# 错误用法（会被拦下，exit 1）：
+#   $env:NEXUS_WS_CLUSTER_ENABLED="true"; docker compose up -d
+#   → [nexus-websocket] 启动失败：已开启集群模式，但未指定 Redis 地址。

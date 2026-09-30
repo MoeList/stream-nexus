@@ -10,10 +10,11 @@ import org.springframework.core.io.Resource;
 import org.springframework.core.io.ResourceLoader;
 
 import java.io.InputStream;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * IP 归属地（城市）查询：给连接台账补一列「从哪来」
@@ -30,7 +31,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * 内网部署其实也用不上它——私有地址段直接判定为「局域网」，压根不进库查询。
  *
  * <p>结果走内存缓存：同一个出口 IP 往往挂着几十上百条连接，没必要反复查。
- * 缓存无上限但有天然上界——IP 种类远少于连接数。
+ * 缓存用<b>有界 LRU</b>（默认 4096 个 IP）：公网扫描或伪造 X-Forwarded-For 时，
+ * IP 种类可以无限增长，无上限缓存会变成内存泄漏。
  *
  * <p>刻意<b>不加 {@code @Component}</b>：本包不在两个服务的组件扫描路径下，
  * 加了也扫不到；库位置是两个服务各自的配置项（{@code nexus.sse.ip2region-path} /
@@ -53,11 +55,26 @@ public class IpLocationService implements DisposableBean {
     private static final String UNKNOWN = "-";
 
     /**
+     * 缓存上限：运维页低频查询，4096 个 IP 足够覆盖典型出口；超出后淘汰最久未用的
+     */
+    private static final int CACHE_LIMIT = 4096;
+
+    /**
      * 为空表示未启用（数据文件缺失或加载失败）
      */
     private final Searcher searcher;
 
-    private final Map<String, String> cache = new ConcurrentHashMap<>();
+    /**
+     * 有界 LRU：{@code accessOrder=true} + {@link LinkedHashMap#removeEldestEntry}。
+     * 外层 {@code synchronizedMap} 保证并发安全；查询本身在锁外执行，重复查询无副作用
+     */
+    private final Map<String, String> cache = Collections.synchronizedMap(
+            new LinkedHashMap<>(256, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+                    return size() > CACHE_LIMIT;
+                }
+            });
 
     /**
      * @param ip2regionPath 数据文件位置（{@code classpath:} / {@code file:} 前缀，由各服务自己的配置项给出）
@@ -107,7 +124,13 @@ public class IpLocationService implements DisposableBean {
         if (searcher == null) {
             return UNKNOWN;
         }
-        return cache.computeIfAbsent(v, this::doSearch);
+        String cached = cache.get(v);
+        if (cached != null) {
+            return cached;
+        }
+        String city = doSearch(v);
+        cache.put(v, city);
+        return city;
     }
 
     private String doSearch(String ip) {

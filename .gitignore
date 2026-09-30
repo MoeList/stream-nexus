@@ -4,6 +4,15 @@ target/
 !**/src/main/**/target/
 !**/src/test/**/target/
 
+### 运行期台账 ###
+# 推送应用台账里存着 apiKey，只应该留在部署机上；集群模式改由 Redis Hash 承载
+data/
+
+### 本地集群配置 ###
+# 含环境相关的 Redis 地址，仅保留在部署机 / 本地，不入库
+nexus-sse/src/main/resources/application-cluster.properties
+nexus-websocket/src/main/resources/application-cluster.properties
+
 ### IntelliJ IDEA ###
 .idea/
 *.iws

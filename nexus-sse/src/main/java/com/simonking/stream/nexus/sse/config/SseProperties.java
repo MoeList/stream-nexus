@@ -50,16 +50,18 @@ public class SseProperties {
     private boolean authEnabled = true;
 
     /**
-     * 推送应用台账的持久化文件（JSON）
+     * 推送应用台账的持久化文件（JSON）——<b>仅单机模式使用</b>
      *
      * <p>管理页新增 / 改 key / 删除都会同步写回这个文件，进程重启时由
      * {@code PushAppStore} 读回内存，避免「重启回到默认应用」。
      *
+     * <p>集群模式（{@code nexus.sse.cluster.enabled=true}）下台账改由 Redis Hash
+     * 承载，本文件只在首次迁移时作为导入源（{@code apps-import-on-startup}）；
+     * 多节点各自读写本地文件会互相覆盖认知。
+     *
      * <p>相对路径以**模块根目录**（{@code nexus-sse}）为基准，而不是进程工作目录：
      * 从仓库根启动、从模块目录启动、或 IDEA 里换个运行目录，台账都落在同一个
      * {@code nexus-sse/data} 下，不会分裂成两份（配绝对路径则原样采用）。
-     * 多实例部署请各自指向独立的本地文件（或改用共享存储实现 {@code PushAppStore}）——
-     * 本实现是单实例的本地文件，多实例各自为政会互相覆盖认知。
      */
     private String appStorePath = "data/push-apps.json";
 

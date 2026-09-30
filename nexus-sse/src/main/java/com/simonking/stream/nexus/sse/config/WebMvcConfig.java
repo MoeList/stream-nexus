@@ -23,21 +23,28 @@ public class WebMvcConfig implements WebMvcConfigurer {
     private final ConnectAuthInterceptor connectAuthInterceptor;
 
     /**
-     * 全局跨域：作用于 {@code /**} 全部路径（SSE 订阅、推送、运维接口、静态测试页），全量放行
+     * 只对「终端接入面」开放跨域：订阅、心跳应答、业务推送
      *
-     * <p>本服务是**内网推送通道**，跨域只做「让浏览器能连上」这一件事，不承载鉴权职责
-     * （真正的鉴权在 {@link PushAuthInterceptor}），因此不引入配置项：
-     * 源、方法、头、凭证全部放开，避免多一套配置就多一处漏配。
+     * <p>这三个入口本来就是给浏览器跨源调用的（{@code EventSource} / {@code fetch}），
+     * 放开源、方法、头、凭证即可，鉴权仍由 {@link PushAuthInterceptor} 与建连令牌负责。
+     *
+     * <p><b>不要</b>再注册 {@code /**}：{@code /sse/admin/**} 的响应里有明文 apiKey，
+     * 简单 GET 不触发预检，浏览器会直接放行跨源读取——管理员登录后，任意站点都能把
+     * 推送凭证读走。管理页与运维接口必须保持同源。
      *
      * <p>用 {@code allowedOriginPatterns("*")} 而非 {@code allowedOrigins("*")}：后者在
      * {@code allowCredentials(true)} 下不接受 {@code *}，配置校验直接失败。
-     *
-     * <p>自定义头（{@code X-Sse-AppId} / {@code X-Sse-Key}）必须放开，
-     * 否则 {@code /sse/push} 的预检会被浏览器判失败。
+     * 自定义头（{@code X-Sse-AppId} / {@code X-Sse-Key}）必须放开，否则推送预检会被判失败。
      */
     @Override
     public void addCorsMappings(CorsRegistry registry) {
-        registry.addMapping("/**")
+        cors(registry, "/sse/subscribe");
+        cors(registry, "/sse/pong");
+        cors(registry, "/sse/push");
+    }
+
+    private void cors(CorsRegistry registry, String pathPattern) {
+        registry.addMapping(pathPattern)
                 .allowedOriginPatterns("*")
                 .allowedMethods("*")
                 .allowedHeaders("*")

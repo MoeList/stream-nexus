@@ -10,10 +10,12 @@ import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -150,6 +152,22 @@ public class WsClientRegistry {
             // 通道可能已失效，兜底走 remove 关闭
         }
         remove(clientId);
+    }
+
+    /**
+     * 强制下线全部连接（集群 KICK_ALL 指令）
+     *
+     * <p>先取 keySet 的快照再逐条回收：回收过程中新注册的连接不在快照里，
+     * 不会被误删；已自行断开的连接重复回收是幂等的。
+     *
+     * @return 被回收的连接数（仅用于日志，不代表全部关闭成功）
+     */
+    public int removeAll() {
+        List<String> ids = new ArrayList<>(clients.keySet());
+        for (String clientId : ids) {
+            remove(clientId);
+        }
+        return ids.size();
     }
 
     /**

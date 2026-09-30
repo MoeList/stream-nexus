@@ -1,5 +1,6 @@
 package com.simonking.nexus.websocket.auth;
 
+import com.simonking.nexus.websocket.config.WsClusterProperties;
 import com.simonking.nexus.websocket.config.WsProperties;
 import com.simonking.stream.nexus.common.constant.NexusConstants;
 import lombok.extern.slf4j.Slf4j;
@@ -11,7 +12,6 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Base64;
-import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -29,9 +29,13 @@ import java.util.concurrent.ConcurrentSkipListMap;
  * （改了等于把联调与文档的基准改掉，而且所有接入方都要跟着换）。
  * 其余应用在 {@code /admin} 管理页运行时增删。
  *
- * <p>增删由 {@link PushAppStore} 落盘到本地 JSON 文件，**重启后台账仍在**：
- * 首次启动（还没有存储文件）播种默认应用并写盘；之后每次启动读回文件。
- * 换个 {@code PushAppStore} 实现（DB / Redis）即可适配多实例，对推送鉴权无感——它只读这里的内存表。
+ * <p><b>内存表 + 版本号缓存</b>：鉴权是推送热路径，每次推送都读一次台账，
+ * 不能每次都问存储。这里常驻一份内存表，靠 {@link PushAppStore#version()} 判断是否过期：
+ * <ul>
+ *     <li>{@code app-cache-ttl} 内的读操作完全不碰存储；</li>
+ *     <li>写操作的节点会广播 {@code APPS_CHANGED}，其他节点收到后立即重载，不必等 TTL；</li>
+ *     <li>存储抖动时只告警、继续用本地缓存——台账短暂陈旧好过推送整体不可用。</li>
+ * </ul>
  *
  * <p>校验顺序不可颠倒：必须**先按 appId 定位应用**（确定归属白名单），再常量时间比对密钥。
  * 反过来做就变成了「遍历所有应用找一个密钥匹配的」，既慢又会泄漏信息。
@@ -54,37 +58,37 @@ public class PushAppRegistry {
     private final PushAppStore store;
 
     /**
-     * 按 appId 有序，管理界面展示时天然稳定排序
+     * 版本检查的最小间隔：防止每次推送都去问一次存储
      */
-    private final ConcurrentMap<String, PushApp> apps = new ConcurrentSkipListMap<>();
+    private final long cacheTtlMillis;
 
-    public PushAppRegistry(WsProperties properties, PushAppStore store) {
+    /**
+     * 写路径互斥：save / remove / reload 三者不能交叉，否则会把旧快照覆盖回去
+     */
+    private final Object lock = new Object();
+
+    /**
+     * 按 appId 有序：管理页列表顺序稳定。整体替换引用而非原地清空，
+     * 让读路径（无锁）永远看到一个完整快照，不会撞上「清空了一半」的中间态
+     */
+    private volatile ConcurrentMap<String, PushApp> apps = new ConcurrentSkipListMap<>();
+
+    /**
+     * 内存表对应的台账版本号：与 {@link PushAppStore#version()} 不同即需要重载
+     */
+    private volatile long loadedVersion = -1L;
+
+    private volatile long lastVersionCheck;
+
+    public PushAppRegistry(WsProperties properties, PushAppStore store, WsClusterProperties clusterProperties) {
         this.authEnabled = properties.isAuthEnabled();
         this.store = store;
-        boolean hasStore = store.exists();
-        if (hasStore) {
-            // 文件存在就采信里面的内容；内置默认应用随后兜底补回
-            store.load().forEach(app -> apps.put(app.appId(), app));
+        this.cacheTtlMillis = Math.max(clusterProperties.getAppCacheTtl().toMillis(), 0);
+        synchronized (lock) {
+            loadAll();
         }
-        boolean dirty = false;
-
-        // 内置默认应用始终在、且三个字段恒定：首次启动 / 老台账里没有 / 被删过 / 被手改过，
-        // 都纠正回内置值并落盘。它是本地联调与推送测试页的保底项
-        PushApp builtIn = apps.get(NexusConstants.DEFAULT_APP_ID);
-        if (builtIn == null) {
-            apps.put(NexusConstants.DEFAULT_APP_ID, defaultApp());
-            dirty = true;
-        } else if (!NexusConstants.DEFAULT_API_KEY.equals(builtIn.apiKey())
-                || !DEFAULT_ALLOWED_MODULES.equals(builtIn.allowedModules())) {
-            // 台账被人手改过：内置凭证只读，一律纠正（页面与接口本来也不许改）
-            apps.put(NexusConstants.DEFAULT_APP_ID, defaultApp());
-            dirty = true;
-        }
-        if (dirty || !hasStore) {
-            persist();
-        }
-        log.info("推送应用载入完成：共 {} 个{}台账 {}，鉴权开关 authEnabled={}", apps.size(),
-                dirty ? "（内置默认应用 " + NexusConstants.DEFAULT_APP_ID + " 已校正），" : "，", store.path(), authEnabled);
+        log.info("[ws] 推送应用载入完成：共 {} 个，台账 {}，鉴权开关 authEnabled={}",
+                apps.size(), store.describe(), authEnabled);
     }
 
     /**
@@ -131,22 +135,32 @@ public class PushAppRegistry {
     }
 
     /**
-     * 台账落盘位置（管理页展示用：让人知道改的东西写在哪，重启会不会丢）
+     * 台账位置（管理页展示用：让人知道改的东西写在哪）
+     *
+     * <p>单机是文件路径、集群是 Redis Hash——字段名不叫 storePath，因为集群下没有文件。
      */
-    public String storePath() {
-        return store.path().toString();
+    public String storeLocation() {
+        return store.describe();
     }
 
-    public Collection<PushApp> list() {
-        return apps.values();
+    public List<PushApp> list() {
+        refreshIfStale();
+        return List.copyOf(apps.values());
     }
 
+    /**
+     * 按 appId 定位应用；未知 appId 返回 empty（鉴权侧据此判 401）
+     */
     public Optional<PushApp> find(String appId) {
-        return Optional.ofNullable(apps.get(appId));
+        if (!StringUtils.hasText(appId)) {
+            return Optional.empty();
+        }
+        refreshIfStale();
+        return Optional.ofNullable(apps.get(appId.trim()));
     }
 
     public boolean contains(String appId) {
-        return apps.containsKey(appId);
+        return find(appId).isPresent();
     }
 
     /**
@@ -158,6 +172,8 @@ public class PushAppRegistry {
         if (!authEnabled) {
             return null;
         }
+        // 多节点下凭证可能刚被别的节点改过：先按 TTL 做一次版本检查，绝大多数情况只是一次时间比较
+        refreshIfStale();
         PushApp app = apps.get(appId);
         if (app == null || !constantTimeEquals(app.apiKey(), apiKey)) {
             return null;
@@ -179,21 +195,27 @@ public class PushAppRegistry {
     }
 
     /**
-     * 新增或覆盖同名应用；先落盘再进内存的顺序反过来会「内存有、磁盘没有」，
-     * 落盘失败直接抛：宁可这一次改不动，也不要让人以为存住了
+     * 新增或覆盖同名应用
+     *
+     * <p>先落存储再进内存：反过来会「内存有、存储没有」，其他节点永远看不到，
+     * 而本节点还一直按新凭证放行。落存储失败直接抛——宁可这一次改不动，
+     * 也不要让人以为存住了。
+     *
+     * <p><b>不在这里推进 {@link #loadedVersion}</b>：写入与取版本之间如果插进另一个节点的写入，
+     * 会话「记下更高版本、手里却是旧数据」，之后除非再有写入，这个节点会一直停在旧台账。
+     * 让版本标记故意落后一截，下一次检查就会从存储重读整张表（代价是一次 HGETALL，写操作本就极少）。
      */
-    public void save(String appId, String apiKey, List<String> allowedModules) {
-        PushApp app = new PushApp(appId, apiKey, normalize(allowedModules));
-        synchronized (apps) {
-            Map<String, PushApp> snapshot = new LinkedHashMap<>(apps);
-            snapshot.put(app.appId(), app);
-            store.save(List.copyOf(snapshot.values()));
+    public void save(PushApp app) {
+        synchronized (lock) {
+            store.save(app);
             apps.put(app.appId(), app);
         }
     }
 
     /**
-     * 删除应用：内置默认应用删不掉（始终在），其余删除后同步落盘
+     * 删除应用：先删存储再删内存，删不动就保持原样
+     *
+     * @return 内存里是否真的有这一条（存储里没有也算删成功——本来就不在）
      */
     public boolean remove(String appId) {
         if (!StringUtils.hasText(appId)) {
@@ -201,16 +223,99 @@ public class PushAppRegistry {
         }
         String key = appId.trim();
         if (isBuiltIn(key)) {
-            log.warn("内置默认应用 {} 不可删除，已忽略该请求", key);
+            log.warn("[ws] 内置默认应用 {} 不可删除，已忽略该请求", key);
             return false;
         }
-        synchronized (apps) {
-            if (apps.remove(key) == null) {
+        synchronized (lock) {
+            if (!apps.containsKey(key)) {
                 return false;
             }
-            store.save(List.copyOf(apps.values()));
+            store.delete(key);
+            apps.remove(key);
             return true;
         }
+    }
+
+    /**
+     * 无条件重载（收到 {@code APPS_CHANGED} 时调用）
+     *
+     * <p>广播是低频事件，这里故意不先比版本号：写节点可能「吸收了」其他节点的版本递增
+     * （HSET 与 INCR 分开两步，中间夹进另一个写者），此时版本号相同不代表内容相同。
+     * 宁可多一次 HGETALL，也不要漏掉一条凭证变更。
+     */
+    public void reload() {
+        synchronized (lock) {
+            loadAll();
+            log.info("[ws] 推送应用台账已重载：{} 条", apps.size());
+        }
+    }
+
+    /**
+     * 台账版本变了就重载（TTL 到期时调用，避免无改动时白读一次整表）
+     *
+     * @return 是否真的重载了
+     */
+    public boolean reloadIfChanged() {
+        synchronized (lock) {
+            if (store.version() == loadedVersion) {
+                return false;
+            }
+            loadAll();
+            log.info("[ws] 推送应用台账已重载：{} 条，版本 {}", apps.size(), loadedVersion);
+            return true;
+        }
+    }
+
+    /**
+     * 按 TTL 节流的版本检查：读路径调用，绝大多数情况下只是一次时间比较
+     *
+     * <p>异常只告警：台账短暂陈旧好过让每次推送都因为存储抖动而失败。
+     */
+    private void refreshIfStale() {
+        long now = System.currentTimeMillis();
+        if (now - lastVersionCheck < cacheTtlMillis) {
+            return;
+        }
+        lastVersionCheck = now;
+        try {
+            if (store.version() == loadedVersion) {
+                return;
+            }
+            reloadIfChanged();
+        } catch (Exception e) {
+            log.warn("[ws] 推送应用台账刷新失败，继续使用本地缓存：{}", e.getMessage());
+        }
+    }
+
+    /**
+     * 读全量台账并校正内置默认应用（调用方必须持有 {@link #lock}）
+     *
+     * <p>校正必须做：台账被人工改过、或从旧版本升级上来时，内置凭证可能缺失或漂移，
+     * 而它是文档与联调页的基准，必须恒等于代码里的常量。
+     *
+     * <p><b>先取版本再读数据</b>：{@link #loadedVersion} 的语义是「内存至少反映了这个版本」。
+     * 反过来的窗口是「读完数据、取版本之间插进一次写入」——会记下更高的版本却拿着旧数据，
+     * 且只要不再有新写入就永远不会自愈。多一次重载只是多发一次 HGETALL。
+     */
+    private void loadAll() {
+        long versionBeforeLoad = store.version();
+
+        Map<String, PushApp> fresh = new LinkedHashMap<>();
+        store.load().forEach(app -> fresh.put(app.appId(), app));
+
+        PushApp builtIn = fresh.get(NexusConstants.DEFAULT_APP_ID);
+        boolean dirty = builtIn == null
+                || !NexusConstants.DEFAULT_API_KEY.equals(builtIn.apiKey())
+                || !DEFAULT_ALLOWED_MODULES.equals(builtIn.allowedModules());
+        if (dirty) {
+            fresh.put(NexusConstants.DEFAULT_APP_ID, defaultApp());
+            store.save(defaultApp());
+        }
+
+        ConcurrentMap<String, PushApp> next = new ConcurrentSkipListMap<>();
+        next.putAll(fresh);
+        apps = next;
+        loadedVersion = versionBeforeLoad;
     }
 
     /**
@@ -221,25 +326,5 @@ public class PushAppRegistry {
             return false;
         }
         return MessageDigest.isEqual(expected.getBytes(StandardCharsets.UTF_8), actual.getBytes(StandardCharsets.UTF_8));
-    }
-
-    /**
-     * 概览信息，供管理界面展示
-     */
-    public Map<String, Object> overview() {
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("total", apps.size());
-        result.put("authEnabled", authEnabled);
-        result.put("defaultAppId", NexusConstants.DEFAULT_APP_ID);
-        // 台账落盘位置：页面直接展示，让人知道改动写在哪、重启还在不在
-        result.put("storePath", storePath());
-        return result;
-    }
-
-    /**
-     * 把当前内存台账写回文件（供启动时播种默认应用后落盘）
-     */
-    private void persist() {
-        store.save(List.copyOf(apps.values()));
     }
 }

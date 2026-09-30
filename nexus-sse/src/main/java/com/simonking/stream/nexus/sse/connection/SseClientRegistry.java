@@ -1,5 +1,7 @@
 package com.simonking.stream.nexus.sse.connection;
 
+import com.simonking.stream.nexus.sse.cluster.ClusterOwners;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -31,6 +33,15 @@ public class SseClientRegistry {
     private final Map<String, Set<String>> moduleIndex = new ConcurrentHashMap<>();
 
     /**
+     * 集群模式的连接归属索引；单机没有这个 Bean，getIfAvailable() 返回 null
+     */
+    private final ObjectProvider<ClusterOwners> ownersProvider;
+
+    public SseClientRegistry(ObjectProvider<ClusterOwners> ownersProvider) {
+        this.ownersProvider = ownersProvider;
+    }
+
+    /**
      * 注册连接
      *
      * @return false 表示 clientId 已存在
@@ -42,6 +53,7 @@ public class SseClientRegistry {
         for (String module : client.getModules()) {
             moduleIndex.computeIfAbsent(module, k -> ConcurrentHashMap.newKeySet()).add(client.getClientId());
         }
+        bindOwner(client.getClientId());
         return true;
     }
 
@@ -112,6 +124,7 @@ public class SseClientRegistry {
                 return ids.isEmpty() ? null : ids;
             });
         }
+        unbindOwner(clientId);
         try {
             client.getEmitter().complete();
         } catch (Exception ignored) {
@@ -140,5 +153,25 @@ public class SseClientRegistry {
         Map<String, Integer> stats = new LinkedHashMap<>();
         moduleIndex.forEach((module, ids) -> stats.put(module, ids.size()));
         return stats;
+    }
+
+    /**
+     * 集群模式登记连接归属；单机没有 ClusterOwners Bean，直接跳过
+     */
+    private void bindOwner(String clientId) {
+        ClusterOwners owners = ownersProvider.getIfAvailable();
+        if (owners != null) {
+            owners.bind(clientId);
+        }
+    }
+
+    /**
+     * 连接回收时删除归属；单机无操作
+     */
+    private void unbindOwner(String clientId) {
+        ClusterOwners owners = ownersProvider.getIfAvailable();
+        if (owners != null) {
+            owners.unbind(clientId);
+        }
     }
 }

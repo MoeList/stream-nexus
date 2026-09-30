@@ -101,8 +101,8 @@ com.simonking.nexus.ws.client
 ```java
 // 1. 构造：两个服务各一组「地址 + 鉴权」，用哪个填哪个（只推 SSE 就可以不写 ws*）
 NexusRestClient client = NexusRestClient.builder()
-        .sseBaseUrl("http://10.0.0.8:8088").sseAppId("order-service").sseApiKey("sse-key")
-        .wsBaseUrl("http://10.0.0.8:8089").wsAppId("order-service").wsApiKey("ws-key")
+        .sseBaseUrl("http://127.0.0.1:8088").sseAppId("order-service").sseApiKey("sse-key")
+        .wsBaseUrl("http://127.0.0.1:8089").wsAppId("order-service").wsApiKey("ws-key")
         .build();
 
 // 2. 推：按终端类型挑方法，一次 HTTP POST，同步拿回执
@@ -154,7 +154,7 @@ builder 里的默认值是两个服务各自内置的默认应用 `test-demo / c
 ```java
 // 1. 构造：参数是 builder 拼的，host / port 都可以不写（默认 127.0.0.1:9091）
 NexusTcpClient client = NexusTcpClient.builder()
-        .host("10.0.0.8")
+        .host("127.0.0.1")
         .build();
 
 // 2. 推：整个 SDK 只有 push(PushRequest) 一个入口，不用先 connect()
