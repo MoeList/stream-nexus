@@ -2,17 +2,24 @@ package com.simonking.stream.nexus.sse.controller;
 
 import com.simonking.stream.nexus.common.constant.NexusConstants;
 import com.simonking.stream.nexus.common.constant.SseConstants;
+import com.simonking.stream.nexus.common.cluster.ClusterMessage;
+import com.simonking.stream.nexus.common.cluster.ClusterMessageType;
 import com.simonking.stream.nexus.common.enums.SseEvent;
 import com.simonking.stream.nexus.common.model.NexusMessage;
 import com.simonking.stream.nexus.common.util.IdGenerator;
 import com.simonking.stream.nexus.common.util.IpUtils;
 import com.simonking.stream.nexus.common.util.NexusUtils;
+import com.simonking.stream.nexus.sse.cluster.ClusterBus;
+import com.simonking.stream.nexus.sse.cluster.ClusterNodeIdentity;
+import com.simonking.stream.nexus.sse.cluster.ClusterOwners;
 import com.simonking.stream.nexus.sse.config.SseProperties;
 import com.simonking.stream.nexus.sse.connection.SseClient;
 import com.simonking.stream.nexus.sse.connection.SseClientRegistry;
 import com.simonking.stream.nexus.sse.core.SseSender;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -36,6 +43,7 @@ import java.util.stream.Collectors;
  * @author simonking
  */
 @RestController
+@Slf4j
 @RequiredArgsConstructor
 public class SseController {
 
@@ -44,6 +52,12 @@ public class SseController {
     private final SseSender sender;
 
     private final SseProperties properties;
+
+    private final ObjectProvider<ClusterOwners> ownersProvider;
+
+    private final ObjectProvider<ClusterBus> clusterBusProvider;
+
+    private final ClusterNodeIdentity identity;
 
     /**
      * 建立 SSE 长连接（永不过期）
@@ -116,15 +130,33 @@ public class SseController {
      * {@code body} 可选（预留给 RTT / 序号等诊断信息），当前不参与判定。
      */
     @PostMapping("/sse/pong")
-    public Map<String, Object> pong(@RequestParam(SseConstants.PARAM_CLIENT_ID) String clientId,
-                                    @RequestBody(required = false) NexusMessage<Object, SseEvent> message) {
+    public Map<String, Object> pong(@RequestParam(SseConstants.PARAM_CLIENT_ID) String clientId) {
         SseClient client = registry.get(clientId);
-        boolean ok = false;
         if (client != null) {
             client.setLastPongTime(System.currentTimeMillis());
-            ok = true;
+            return Map.of("ok", true);
         }
-        return Map.of("ok", ok);
+
+        // 连接不在本节点：负载均衡可能把 PONG 打到了别的节点，按 owners 索引定向转发
+        ClusterOwners owners = ownersProvider.getIfAvailable();
+        ClusterBus bus = clusterBusProvider.getIfAvailable();
+        if (owners != null && bus != null) {
+            String owner = owners.ownerOf(clientId);
+            if (owner != null && !owner.equals(identity.getNodeId())) {
+                try {
+                    bus.publishNode(owner, ClusterMessage.builder()
+                            .type(ClusterMessageType.PONG)
+                            .originNodeId(identity.getNodeId())
+                            .clientId(clientId)
+                            .ts(System.currentTimeMillis())
+                            .build());
+                    return Map.of("ok", true, "forwarded", true);
+                } catch (Exception e) {
+                    log.warn("[sse] PONG 转发失败，clientId={}, owner={}：{}", clientId, owner, e.getMessage());
+                }
+            }
+        }
+        return Map.of("ok", false);
     }
 
     /**

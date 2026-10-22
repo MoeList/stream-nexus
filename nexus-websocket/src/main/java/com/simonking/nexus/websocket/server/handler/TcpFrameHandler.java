@@ -17,6 +17,7 @@ import io.netty.handler.timeout.IdleState;
 import io.netty.handler.timeout.IdleStateEvent;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.web.server.ResponseStatusException;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -150,6 +151,11 @@ public class TcpFrameHandler extends SimpleChannelInboundHandler<String> {
             write(ctx, TcpEvent.RESULT, result);
         } catch (IllegalArgumentException e) {
             write(ctx, TcpEvent.ERROR, e.getMessage());
+        } catch (ResponseStatusException e) {
+            // 集群模式下的发布失败：413 消息体超限 / 503 Redis 不可用。
+            // 长连接上没有状态码可用，把原因写进 ERROR 报文即可；
+            // 绝不能让它冒泡到 exceptionCaught——那会把一条可恢复的推送失败变成断连
+            write(ctx, TcpEvent.ERROR, e.getReason());
         }
     }
 

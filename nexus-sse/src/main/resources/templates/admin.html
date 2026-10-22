@@ -37,6 +37,27 @@
         <span class="brand-text">Stream Nexus</span>
         <!-- 服务标识：图标统一后靠它区分两个服务，避免开着两个页面认不出自己在哪 -->
         <span class="svc-tag">SSE</span>
+        <!-- 运行模式：单机 / 集群。服务端渲染而非等接口回来再打标——模式由启动参数决定，
+             页面生命周期内不会变，等接口只会先闪一帧错误标识。
+             集群下右侧补「在线节点 / 已知节点」，缺节点时整枚胶囊转告警色；
+             图标靠 CSS 切换（.is-cluster），不在 SVG 上挂 th:* -->
+        <span id="modePill" class="mode-pill" th:classappend="${cluster} ? 'is-cluster' : ''"
+              th:title="${cluster} ? '集群模式：连接台账跨节点聚合，推送与控制指令走 Redis Pub/Sub 广播；右侧为在线节点 / 已知节点' : '单机模式：只统计本进程的连接，未启用 Redis 集群总线'">
+            <svg class="mode-ico ico-cluster" viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M8 3.4 3.4 12M8 3.4l4.6 8.6M3.9 12.3h8.2"/>
+                <circle cx="8" cy="3.2" r="1.7"/>
+                <circle cx="3.2" cy="12.4" r="1.7"/>
+                <circle cx="12.8" cy="12.4" r="1.7"/>
+            </svg>
+            <svg class="mode-ico ico-solo" viewBox="0 0 16 16" aria-hidden="true">
+                <rect x="3.1" y="3.1" width="9.8" height="9.8" rx="2.6"/>
+                <circle class="solid" cx="8" cy="8" r="1.7"/>
+            </svg>
+            <span class="mode-name" th:text="${cluster} ? '集群' : '单机'">单机</span>
+            <span class="mode-metric" th:if="${cluster}">
+                <b id="modeOnline">-</b><span class="mode-slash">/</span><span id="modeKnown">-</span>
+            </span>
+        </span>
     </div>
     <div class="nav">
         <a th:href="@{/admin}" th:classappend="${active == 'admin'} ? 'active' : ''">连接管理</a>
@@ -46,7 +67,20 @@
     </div>
     <div class="meta">
         <span class="live"><i></i>LIVE</span>
-        <span th:text="'心跳 ' + ${heartbeatInterval} + 's · 失联判定 ' + ${heartbeatTimeout} + 's · 连接上限 ' + ${maxConnections}"></span>
+        <!-- 运行参数拆成键值对：原来一整句「心跳 15s · 失联判定 45s · 单节点最大连接数 200」
+             和 LIVE / 退出挤在一起，扫读时要逐字断句 -->
+        <span class="kv" title="心跳周期：每个周期向所有连接下发一次 ping">
+            <span class="k">心跳</span><span class="v" th:text="${heartbeatInterval} + 's'">15s</span>
+        </span>
+        <span class="kv" title="失联判定：超过该时长没收到客户端 pong 即标为疑似失联">
+            <span class="k">失联</span><span class="v" th:text="${heartbeatTimeout} + 's'">45s</span>
+        </span>
+        <!-- 连接上限是「按进程」的：集群下每个节点各自限制，总容量 = 节点数 × 该值，
+             标签必须带限定词，否则集群总数超过上限时会让人以为限制失效 -->
+        <span class="kv" th:title="${cluster} ? '上限按进程计：集群下每个节点各自限制，总容量 = 节点数 × 该值；0 表示不限制' : '本进程最大连接数；0 表示不限制'">
+            <span class="k" th:text="${cluster} ? '上限/节点' : '上限'">上限</span>
+            <span class="v" th:text="${maxConnections}">200</span>
+        </span>
         <a class="logout" th:href="@{/logout}" title="退出登录：清空会话并回到登录页">退出</a>
     </div>
 </div>
@@ -63,6 +97,9 @@
     <div class="tabs">
         <button id="tabBtnConn" class="active" onclick="switchTab('conn')">连接台账</button>
         <button id="tabBtnApp" onclick="switchTab('app')">推送应用（appId / key）</button>
+        <!-- 集群节点：单机没有拓扑可看，整条页签由服务端 th:if 掉；
+             角标是「在线/已知」，不切页签也能看出节点有没有掉 -->
+        <button id="tabBtnNode" th:if="${cluster}" onclick="switchTab('node')">集群节点<span class="tab-count" id="tabNodeCount">-</span></button>
     </div>
 
     <!-- ========== 连接台账 ========== -->
@@ -72,6 +109,9 @@
                 <div class="stat">
                     <div class="label">在线连接</div>
                     <div class="num" id="total">-</div>
+                    <!-- 集群下这个数是多节点合计：标明「来自几个节点 / 本节点几条」，
+                         节点掉线导致的数字骤降才不会被当成连接凭空消失 -->
+                    <div class="sub" id="totalScope" th:text="${cluster} ? '跨节点聚合' : '本进程'">本进程</div>
                 </div>
                 <div class="stat">
                     <div class="label">疑似失联</div>
@@ -127,13 +167,16 @@
             <table>
                 <thead>
                 <tr>
-                    <th style="width:22%">clientId</th>
-                    <th style="width:14%">客户端 IP</th>
-                    <th style="width:16%">业务模块</th>
-                    <th style="width:13%">建连时间</th>
-                    <th style="width:13%">最近心跳</th>
-                    <th style="width:14%">静默 / 状态</th>
-                    <th style="width:8%">操作</th>
+                    <th style="width:20%">clientId</th>
+                    <!-- 节点列：集群下每条连接标明在哪个节点，踢下线虽会广播全集群，但排障时得知道源头；
+                         单机只有本进程，人人同值的一列纯属占宽，服务端直接不渲染 -->
+                    <th th:if="${cluster}" style="width:10%">节点</th>
+                    <th style="width:12%">客户端 IP</th>
+                    <th style="width:15%">业务模块</th>
+                    <th style="width:12%">建连时间</th>
+                    <th style="width:12%">最近心跳</th>
+                    <th style="width:12%">静默 / 状态</th>
+                    <th style="width:7%">操作</th>
                 </tr>
                 </thead>
                 <tbody id="tbody"></tbody>
@@ -174,7 +217,7 @@
 
         <div class="card">
             <h3 class="card-title">应用列表</h3>
-            <p class="card-sub">/sse/admin/apps · 新增 / 修改 / 删除会同步写入服务端台账文件，重启后仍在；删除后该 appId 的推送立即 401。内置默认应用 test-demo 整条只读：始终存在，appId / apiKey / 白名单 都不可改、不可删除，要别的凭证请新建应用</p>
+            <p class="card-sub">/sse/admin/apps · 新增 / 修改 / 删除会同步写入服务端台账（单机为本地 JSON 文件，集群为 Redis Hash，多节点共享并立即生效）；删除后该 appId 的推送立即 401。内置默认应用 test-demo 整条只读：始终存在，appId / apiKey / 白名单 都不可改、不可删除，要别的凭证请新建应用</p>
             <p class="card-sub" id="appStorePath" style="color:var(--muted)"></p>
             <div class="table-wrap">
                 <table>
@@ -192,6 +235,55 @@
             </div>
         </div>
     </div>
+
+    <!-- ========== 集群节点（仅集群模式渲染） ========== -->
+    <div id="tabNode" th:if="${cluster}" hidden>
+        <div class="card">
+            <div class="stats">
+                <div class="stat">
+                    <div class="label">在线节点</div>
+                    <div class="num" id="nodeOnline">-</div>
+                    <div class="sub">在线 / 已知</div>
+                </div>
+                <div class="stat">
+                    <div class="label">本节点</div>
+                    <div class="num sm" id="nodeSelf" style="word-break:break-all">-</div>
+                    <div class="sub" id="nodeSelfSub">-</div>
+                </div>
+                <div class="stat">
+                    <div class="label">节点心跳</div>
+                    <div class="num" id="nodeHeartbeat">-</div>
+                    <div class="sub">节点注册租约的刷新周期</div>
+                </div>
+                <div class="stat">
+                    <div class="label">离线判定</div>
+                    <div class="num" id="nodeTimeout">-</div>
+                    <div class="sub">超时未上报即视为离线</div>
+                </div>
+            </div>
+            <div class="toolbar" style="margin-top:12px">
+                <button onclick="loadNodes()">刷新</button>
+                <span id="nodeTip" style="color:var(--muted);font-size:12px"></span>
+            </div>
+        </div>
+
+        <div class="table-wrap">
+            <table>
+                <thead>
+                <tr>
+                    <th style="width:22%">nodeId</th>
+                    <th style="width:9%">节点位</th>
+                    <th style="width:19%">地址</th>
+                    <th style="width:13%">连接数</th>
+                    <th style="width:18%">最后心跳</th>
+                    <th style="width:19%">状态</th>
+                </tr>
+                </thead>
+                <tbody id="nodeTbody"></tbody>
+            </table>
+            <div class="empty" id="nodeEmpty" hidden>暂无节点</div>
+        </div>
+    </div>
 </div>
 
 <footer class="footer">
@@ -205,12 +297,19 @@
 </footer>
 
 <script th:src="@{/js/nexus-tech.js}"></script>
+<script th:inline="javascript">
+    /* 运行模式由服务端配置决定，页面生命周期内不会变：前端只读这个常量决定列 / 页签是否渲染，
+       不再等 /sse/admin/** 接口回来判断，避免首屏先按错误模式画一遍再改 */
+    const IS_CLUSTER = /*[[${cluster}]]*/ false;
+</script>
 <script>
 let items = [];
 let meta = {};
 let timer = null;
 let apps = [];
 let defaultAppId = '';
+// 集群节点页签的数据：切页签时按需拉取，不做自动刷新
+let nodeMeta = {};
 // 正在行内编辑的 appId，空串表示没有
 let editingAppId = '';
 // 上一次渲染见过的 clientId：用来判断哪些行是新来的（新行才做入场动画）
@@ -226,13 +325,21 @@ let serverSkew = 0;
 let uptimeTimer = null;
 
 function switchTab(name) {
+    // 单机没有「集群节点」：按钮与面板都由服务端 th:if 掉，这里按「存在才处理」写
+    const nodeBtn = document.getElementById('tabBtnNode');
+    const nodePane = document.getElementById('tabNode');
+    const isNode = name === 'node' && !!nodePane;
     const isConn = name === 'conn';
+    const isApp = name === 'app';
     document.getElementById('tabConn').hidden = !isConn;
-    document.getElementById('tabApp').hidden = isConn;
+    document.getElementById('tabApp').hidden = !isApp;
+    if (nodePane) nodePane.hidden = !isNode;
     document.getElementById('tabBtnConn').className = isConn ? 'active' : '';
-    document.getElementById('tabBtnApp').className = isConn ? '' : 'active';
+    document.getElementById('tabBtnApp').className = isApp ? 'active' : '';
+    if (nodeBtn) nodeBtn.className = isNode ? 'active' : '';
     if (isConn) load();
-    else loadApps();
+    else if (isApp) loadApps();
+    else if (isNode) loadNodes();
 }
 
 async function load() {
@@ -244,7 +351,24 @@ async function load() {
         // 每次拉到服务端时间就校准一次偏差（本机时钟可能被手动改过 / 有漂移）
         if (meta.serverTime) serverSkew = meta.serverTime - Date.now();
         document.getElementById('refreshAt').textContent = new Date().toLocaleTimeString();
-        setTip('tip', '');
+        // 顶栏模式胶囊 + 页签角标：集群下补「在线节点 / 已知节点」，
+        // 聚合不完整时整枚胶囊转告警色（与台账顶部「部分节点未响应」提示同源）
+        if (IS_CLUSTER) {
+            document.getElementById('modeOnline').textContent = meta.receivedNodes ?? 0;
+            document.getElementById('modeKnown').textContent = meta.expectedNodes ?? 0;
+            document.getElementById('tabNodeCount').textContent =
+                (meta.receivedNodes ?? 0) + '/' + (meta.expectedNodes ?? 0);
+            const pill = document.getElementById('modePill');
+            if (pill) pill.classList.toggle('degraded', !!meta.partial);
+        }
+        // 聚合不完整时必须明说缺了谁：否则「少了十几条」很容易被当成「真的没连接」
+        if (meta.partial) {
+            const missing = (meta.missingNodes || []).join('、') || '未知节点';
+            setTip('tip', '部分节点未响应（' + (meta.receivedNodes ?? 0) + '/' + (meta.expectedNodes ?? 0)
+                + '）：' + missing + '，下表不完整', true);
+        } else {
+            setTip('tip', '');
+        }
         render();
     } catch (e) {
         setTip('tip', '拉取失败：' + e.message, true);
@@ -313,7 +437,9 @@ function matches(it) {
         || String(it.ip || '').toLowerCase().includes(kw)
         // 归属地：缺库时服务端下发 '-'，参与匹配只会把 '-' 当成关键字误中，故跳过占位值
         || (it.city && it.city !== '-' && it.city.toLowerCase().includes(kw))
-        || (it.modules || []).join(',').toLowerCase().includes(kw);
+        || (it.modules || []).join(',').toLowerCase().includes(kw)
+        // 集群下可按节点过滤：排障时先看某个节点上的连接
+        || String(it.nodeId || '').toLowerCase().includes(kw);
 }
 
 /** 筛选条件变了要回第 1 页：停在第 5 页时改个关键字，结果可能只剩 3 条 */
@@ -361,6 +487,13 @@ function render() {
     prevTotal = total;
 
     setNum('total', total);
+    // 连接范围：集群下把「总量来自几个节点 + 本节点几条」摊开，
+    // 节点掉线导致的数字骤降能立刻看出是聚合缺了谁
+    const scope = document.getElementById('totalScope');
+    if (scope && IS_CLUSTER) {
+        const selfCount = items.filter(it => (it.nodeId || meta.nodeId) === meta.nodeId).length;
+        scope.textContent = '来自 ' + (meta.receivedNodes ?? 0) + ' 个节点 · 本节点 ' + selfCount + ' 条';
+    }
     setNum('staleCount', stale);
     document.getElementById('staleCount').className = 'num' + (stale > 0 ? ' warn' : '');
     document.getElementById('hbTimeout').textContent = meta.heartbeatTimeout ? duration(meta.heartbeatTimeout) : '-';
@@ -405,6 +538,17 @@ function render() {
         cid.className = 'cid';
         cid.textContent = it.clientId;
         tr.appendChild(cid);
+
+        // 节点：只在集群下渲染这一列（表头同为服务端 th:if，两者必须同源，
+        // 否则列数与表头对不上）；单机只有本进程，不占一列
+        if (IS_CLUSTER) {
+            const nd = document.createElement('td');
+            nd.textContent = it.nodeId || meta.nodeId || '-';
+            if (it.nodeId && it.nodeId === meta.nodeId) {
+                nd.appendChild(sub('本节点'));
+            }
+            tr.appendChild(nd);
+        }
 
         const ipt = document.createElement('td');
         ipt.className = 'cid';
@@ -509,6 +653,88 @@ function setTip(id, text, isErr) {
     el.textContent = text;
 }
 
+/**
+ * 集群节点：单机模式也返回一条（本进程），cluster=false 只影响「运行模式」文案。
+ * 节点变动是低频事件，不做自动刷新：切页签和手动刷新足够。
+ */
+async function loadNodes() {
+    try {
+        const resp = await fetch('/sse/admin/cluster/nodes');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        nodeMeta = await resp.json();
+        if (nodeMeta.serverTime) serverSkew = nodeMeta.serverTime - Date.now();
+        setTip('nodeTip', '');
+        renderNodes();
+    } catch (e) {
+        setTip('nodeTip', '节点列表拉取失败：' + e.message, true);
+    }
+}
+
+function renderNodes() {
+    const online = nodeMeta.online ?? 0;
+    const total = nodeMeta.total ?? 0;
+    // 只报在线数看不出「有没有节点掉队」，必须带上已知总数
+    document.getElementById('nodeOnline').textContent = online + ' / ' + total;
+    document.getElementById('nodeSelf').textContent = nodeMeta.nodeId || '-';
+    document.getElementById('nodeSelfSub').textContent =
+        '节点位 ' + (nodeMeta.nodeSeq ?? '-') + ' · ' + (nodeMeta.address || '-');
+    document.getElementById('nodeHeartbeat').textContent =
+        nodeMeta.nodeHeartbeatInterval ? duration(nodeMeta.nodeHeartbeatInterval) : '-';
+    document.getElementById('nodeTimeout').textContent =
+        nodeMeta.nodeTimeout ? duration(nodeMeta.nodeTimeout) : '-';
+    // 页签角标跟着节点注册表走：不看页签内容也知道有没有节点离线
+    document.getElementById('tabNodeCount').textContent = online + '/' + total;
+    const list = nodeMeta.items || [];
+    const tbody = document.getElementById('nodeTbody');
+    tbody.innerHTML = '';
+    list.forEach(it => {
+        const tr = document.createElement('tr');
+
+        const id = nodeCell(it.nodeId, 'cid');
+        if (it.self) {
+            const selfBadge = document.createElement('span');
+            selfBadge.className = 'badge ok';
+            selfBadge.textContent = '本节点';
+            selfBadge.style.marginTop = '4px';
+            selfBadge.style.display = 'inline-block';
+            id.appendChild(selfBadge);
+        }
+        tr.appendChild(id);
+
+        tr.appendChild(nodeCell(String(it.nodeSeq ?? '-')));
+        tr.appendChild(nodeCell(it.address || '-'));
+
+        const cc = nodeCell(String(it.clientCount ?? 0));
+        const mods = Object.entries(it.modules || {});
+        if (mods.length) {
+            cc.appendChild(sub(mods.map(([m, n]) => m + ' · ' + n).join('，')));
+        }
+        tr.appendChild(cc);
+
+        const ls = nodeCell(fmt(it.lastSeen));
+        ls.appendChild(sub('静默 ' + duration(it.silence ?? 0)));
+        tr.appendChild(ls);
+
+        const st = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = 'badge ' + (it.online ? 'ok' : 'stale');
+        badge.textContent = it.online ? '在线' : '离线';
+        st.appendChild(badge);
+        st.appendChild(sub('启动于 ' + fmt(it.startTime)));
+        tr.appendChild(st);
+
+        tbody.appendChild(tr);
+    });
+    document.getElementById('nodeEmpty').hidden = list.length > 0;
+}
+
+function nodeCell(text, cls) {
+    const td = document.createElement('td');
+    if (cls) td.className = cls;
+    td.textContent = text;
+    return td;
+}
+
 async function loadApps() {
     try {
         const resp = await fetch('/sse/admin/apps');
@@ -516,9 +742,9 @@ async function loadApps() {
         const data = await resp.json();
         apps = data.items || [];
         defaultAppId = data.defaultAppId || '';
-        // 台账文件位置由服务端下发：改完东西知道落在哪，也顺带说明「重启还在」
+        // 台账位置由服务端下发：单机是文件路径，集群是 Redis Hash（describe() 里已注明「多节点共享」）
         document.getElementById('appStorePath').textContent =
-            data.storePath ? '台账文件：' + data.storePath + '（重启后自动读回）' : '';
+            data.storeLocation ? '台账位置：' + data.storeLocation : '';
         setTip('appTip', '');
         renderApps();
     } catch (e) {

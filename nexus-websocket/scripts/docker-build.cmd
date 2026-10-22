@@ -8,14 +8,14 @@ REM 只保留 :latest 镜像：构建后自动删除被新 latest 顶替掉的�
 REM
 REM 可选环境变量：
 REM   IMAGE_NAME   镜像名，默认 simonking/nexus-websocket
-REM   JAR_VERSION  jar 版本号，默认 1.0.0（需与 pom.xml 的 <version> 一致）
+REM   JAR_VERSION  jar 版本号，默认 2.0.0（需与 nexus-websocket/pom.xml 的 <version> 一致）
 REM
 REM 用法：
 REM   nexus-websocket\scripts\docker-build.cmd
 
 setlocal enabledelayedexpansion
 if "%IMAGE_NAME%"=="" set IMAGE_NAME=simonking/nexus-websocket
-if "%JAR_VERSION%"=="" set JAR_VERSION=1.0.0
+if "%JAR_VERSION%"=="" set JAR_VERSION=2.0.0
 
 pushd "%~dp0..\.."
 

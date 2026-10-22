@@ -7,11 +7,14 @@ import com.simonking.stream.nexus.common.model.NexusMessage;
 import com.simonking.stream.nexus.sse.config.SseProperties;
 import com.simonking.stream.nexus.sse.connection.SseClient;
 import com.simonking.stream.nexus.sse.connection.SseClientRegistry;
+import com.simonking.stream.nexus.sse.core.ParallelTasks;
 import com.simonking.stream.nexus.sse.core.SseSender;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+
+import java.util.concurrent.Executor;
 
 /**
  * 心跳（PING/PONG）+ 连接回收
@@ -33,7 +36,6 @@ import org.springframework.stereotype.Component;
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class HeartbeatTask {
 
     private final SseClientRegistry registry;
@@ -42,38 +44,53 @@ public class HeartbeatTask {
 
     private final SseProperties properties;
 
+    private final Executor heartbeatExecutor;
+
+    public HeartbeatTask(SseClientRegistry registry, SseSender sender, SseProperties properties,
+                         @Qualifier("sseHeartbeatExecutor") Executor heartbeatExecutor) {
+        this.registry = registry;
+        this.sender = sender;
+        this.properties = properties;
+        this.heartbeatExecutor = heartbeatExecutor;
+    }
+
     @Scheduled(fixedDelayString = "${nexus.sse.heartbeat-interval:15000}")
     public void tick() {
         long now = System.currentTimeMillis();
         long heartbeatTimeout = properties.getHeartbeatTimeout().toMillis();
         long maxLifetime = properties.getMaxLifetime().toMillis();
 
-        for (SseClient client : registry.all()) {
-            // 1. 长时间未回心跳：客户端失联（半开连接 / 页面被冻结 / 进程被杀）
-            if (heartbeatTimeout > 0 && now - client.getLastPongTime() > heartbeatTimeout) {
-                log.info("[sse] recycle by heartbeat timeout, clientId={}, lastPong={}",
-                        client.getClientId(), client.getLastPongTime());
-                registry.remove(client.getClientId());
-                continue;
-            }
-            // 2. 软重置：达到最大存活时间，客户端会自动重连
-            if (maxLifetime > 0 && now - client.getCreateTime() > maxLifetime) {
-                log.info("[sse] recycle by max lifetime, clientId={}", client.getClientId());
-                registry.remove(client.getClientId());
-                continue;
-            }
-            // 3. 下发心跳：客户端收到后应回 PONG（不设置 id，避免污染客户端的 Last-Event-ID）
-            try {
-                sender.send(client, NexusMessage.<Object, SseEvent>builder()
-                        .event(SseEvent.PING)
-                        .bizModule(SseConstants.SYS_MODULE)
-                        .action(NexusConstants.ACTION_PING)
-                        .ts(now)
-                        .build());
-            } catch (Exception e) {
-                log.info("[sse] recycle by heartbeat failure, clientId={}", client.getClientId());
-                registry.remove(client.getClientId());
-            }
+        // 单线程遍历 3 万连接时，一轮 PING 可能超过 15s，导致 lastPong 判定失真、
+        // 心跳消息互相排队。分片并行后单轮耗时压到「最慢一片」，调度间隔才有意义
+        ParallelTasks.forEach(registry.all(), heartbeatExecutor,
+                client -> heartbeatOne(client, now, heartbeatTimeout, maxLifetime));
+    }
+
+    private void heartbeatOne(SseClient client, long now, long heartbeatTimeout, long maxLifetime) {
+        // 1. 长时间未回心跳：客户端失联（半开连接 / 页面被冻结 / 进程被杀）
+        if (heartbeatTimeout > 0 && now - client.getLastPongTime() > heartbeatTimeout) {
+            log.info("[sse] recycle by heartbeat timeout, clientId={}, lastPong={}",
+                    client.getClientId(), client.getLastPongTime());
+            registry.remove(client.getClientId());
+            return;
+        }
+        // 2. 软重置：达到最大存活时间，客户端会自动重连
+        if (maxLifetime > 0 && now - client.getCreateTime() > maxLifetime) {
+            log.info("[sse] recycle by max lifetime, clientId={}", client.getClientId());
+            registry.remove(client.getClientId());
+            return;
+        }
+        // 3. 下发心跳：客户端收到后应回 PONG（不设置 id，避免污染客户端的 Last-Event-ID）
+        try {
+            sender.send(client, NexusMessage.<Object, SseEvent>builder()
+                    .event(SseEvent.PING)
+                    .bizModule(SseConstants.SYS_MODULE)
+                    .action(NexusConstants.ACTION_PING)
+                    .ts(now)
+                    .build());
+        } catch (Exception e) {
+            log.info("[sse] recycle by heartbeat failure, clientId={}", client.getClientId());
+            registry.remove(client.getClientId());
         }
     }
 }

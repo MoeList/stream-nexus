@@ -72,10 +72,34 @@ public class LoginController {
             log.warn("管理页登录失败：username={}, ip={}", username, request.getRemoteAddr());
             return "redirect:/login?error=1&redirect=" + URLEncoder.encode(target, StandardCharsets.UTF_8);
         }
+        invalidateExistingSession(request);
         HttpSession session = request.getSession(true);
         session.setAttribute(AdminAuthFilter.SESSION_KEY, username);
         request.changeSessionId();
         return "redirect:" + target;
+    }
+
+    /**
+     * 登录前先作废旧会话
+     *
+     * <p>不能直接对已有会话调用 {@code changeSessionId()}：Spring Session 的
+     * {@code RedisSessionRepository} 在「非新建会话」换 ID 时执行
+     * {@code RENAME oldKey newKey}，而 Redis Cluster 要求两个 Key 在同一 hash slot——
+     * sessionId 不同，slot 几乎必然不同，结果是第二次登录直接 500（CROSSSLOT）。
+     * 先作废再新建，新会话 {@code isNew=true}，仓库会跳过 RENAME，只写新 Key。
+     *
+     * <p>顺带解决「换账号登录」的语义：旧账号的会话整体丢弃，而不是把属性带到新会话里。
+     */
+    private void invalidateExistingSession(HttpServletRequest request) {
+        HttpSession existing = request.getSession(false);
+        if (existing == null) {
+            return;
+        }
+        try {
+            existing.invalidate();
+        } catch (IllegalStateException ignored) {
+            // 并发登出已经作废过，继续新建即可
+        }
     }
 
     /**
@@ -111,13 +135,21 @@ public class LoginController {
     }
 
     /**
-     * 只接受站内绝对路径：挡掉 {@code //evil.com}、{@code http://evil.com} 这类开放重定向
+     * 只接受站内绝对路径：挡掉 {@code //evil.com}、{@code http://evil.com}、
+     * {@code /\evil.com}（浏览器会把反斜杠规范化为 {@code //}）以及响应头注入用的控制字符
+     *
+     * <p>包级可见，便于单测直接覆盖这些边界。
      */
-    private String safeRedirect(String redirect) {
+    String safeRedirect(String redirect) {
         if (!StringUtils.hasText(redirect)) {
             return "/admin";
         }
         String value = redirect.trim();
-        return value.startsWith("/") && !value.startsWith("//") ? value : "/admin";
+        boolean unsafe = !value.startsWith("/")
+                || value.startsWith("//")
+                || value.startsWith("/\\")
+                || value.indexOf('\\') >= 0
+                || value.chars().anyMatch(Character::isISOControl);
+        return unsafe ? "/admin" : value;
     }
 }

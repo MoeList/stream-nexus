@@ -8,7 +8,7 @@
 #
 # 可选环境变量：
 #   IMAGE_NAME   镜像名，默认 simonking/nexus-websocket
-#   JAR_VERSION  jar 版本号，默认 1.0.0（需与 pom.xml 的 <version> 一致）
+#   JAR_VERSION  jar 版本号，默认 2.0.0（需与 nexus-websocket/pom.xml 的 <version> 一致）
 #
 # 用法：
 #   ./nexus-websocket/scripts/docker-build.sh
@@ -18,7 +18,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 IMAGE_NAME="${IMAGE_NAME:-simonking/nexus-websocket}"
-JAR_VERSION="${JAR_VERSION:-1.0.0}"
+JAR_VERSION="${JAR_VERSION:-2.0.0}"
 
 # 记录构建前的 latest 镜像 ID，构建后把旧的这份删掉，做到只保留最新一次构建的 latest
 OLD_IMAGE_ID="$(docker images -q "${IMAGE_NAME}:latest" 2>/dev/null | head -n1 || true)"

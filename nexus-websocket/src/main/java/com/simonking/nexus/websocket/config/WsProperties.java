@@ -31,7 +31,7 @@ public class WsProperties {
     /**
      * WebSocket 服务端口（终端建连）
      */
-    private int wsPort = 9090;
+    private int wsPort = 19090;
 
     /**
      * TCP 服务端口（业务系统建连，长连接版推送通道）

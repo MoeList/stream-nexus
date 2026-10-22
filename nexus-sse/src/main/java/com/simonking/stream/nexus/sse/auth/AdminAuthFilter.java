@@ -13,6 +13,7 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.util.AntPathMatcher;
 import org.springframework.util.StringUtils;
+import org.springframework.web.cors.CorsUtils;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
@@ -50,8 +51,14 @@ public class AdminAuthFilter extends OncePerRequestFilter {
      *
      * <p>刻意写成白名单而非「拦截 /** 再放行登录页」：漏配时是「少拦一个」而不是「全站打不开」，
      * 后者一旦发生，连登录页都进不去，属于灾难级误伤。
+     *
+     * <p>页面同时列了无尾斜杠与 {@code /**} 两种写法：前者覆盖精确访问，
+     * 后者覆盖 {@code /admin/}、{@code /console/xxx} 这类子路径，
+     * 避免将来开启 trailing-slash 匹配后出现绕过。
      */
-    private static final String[] PROTECTED_PATTERNS = {"/admin", "/console", "/sse/admin/**"};
+    private static final String[] PROTECTED_PATTERNS = {
+            "/admin", "/admin/**", "/console", "/console/**", "/sse/admin/**"
+    };
 
     private static final AntPathMatcher PATH_MATCHER = new AntPathMatcher();
 
@@ -74,6 +81,11 @@ public class AdminAuthFilter extends OncePerRequestFilter {
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
         if (!properties.isAuthEnabled()) {
+            return true;
+        }
+        // CORS 预检不带 Cookie：放行让 DispatcherServlet 按跨域规则处理。
+        // 未开放跨域的路径会得到 403，而不是误导性的 401
+        if (CorsUtils.isPreFlightRequest(request)) {
             return true;
         }
         String path = requestPath(request);

@@ -1,5 +1,6 @@
 package com.simonking.stream.nexus.sse.controller;
 
+import com.simonking.stream.nexus.sse.config.ClusterProperties;
 import com.simonking.stream.nexus.sse.config.SseProperties;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Controller;
@@ -26,6 +27,13 @@ public class PageController {
     private final SseProperties properties;
 
     /**
+     * 运行模式开关：页面顶栏要标「单机 / 集群」，判定口径必须与 Bean 装配同源——
+     * 集群相关 Bean 全部按 {@code nexus.sse.cluster.enabled=true} 条件装配，
+     * 所以直接读配置类，而不是去探测某个 Bean 是否存在（后者在切片测试里容易失真）
+     */
+    private final ClusterProperties clusterProperties;
+
+    /**
      * 根路径直达管理页
      */
     @GetMapping("/")
@@ -46,7 +54,8 @@ public class PageController {
     }
 
     /**
-     * 服务端参数：心跳节奏与连接上限由配置决定，页面不写死，避免配置改了页面还显示旧值
+     * 服务端参数：心跳节奏、连接上限与运行模式由配置决定，页面不写死，
+     * 避免配置改了页面还显示旧值
      */
     private void fill(Model model, String active, String title) {
         model.addAttribute("active", active);
@@ -54,6 +63,9 @@ public class PageController {
         model.addAttribute("heartbeatInterval", properties.getHeartbeatInterval().toSeconds());
         model.addAttribute("heartbeatTimeout", properties.getHeartbeatTimeout().toSeconds());
         model.addAttribute("maxConnections", properties.getMaxConnections());
+        // 运行模式：由启动参数决定，页面生命周期内不会变，故服务端直接渲染，
+        // 不等 /sse/admin/** 接口回来再打标（那会先闪一帧错误标识）
+        model.addAttribute("cluster", clusterProperties.isEnabled());
         // 下发给页面：开启建连鉴权时，推送测试页必须在连接前拦住没填令牌的情况，
         // 否则 EventSource 只会拿到一个 401 然后无脑重连，页面上看不出原因
         model.addAttribute("connectAuthEnabled", properties.isConnectAuthEnabled());

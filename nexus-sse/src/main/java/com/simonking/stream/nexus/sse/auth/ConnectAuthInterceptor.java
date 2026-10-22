@@ -11,6 +11,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
+import org.springframework.web.cors.CorsUtils;
 import org.springframework.web.servlet.HandlerInterceptor;
 
 import java.nio.charset.StandardCharsets;
@@ -48,6 +49,11 @@ public class ConnectAuthInterceptor implements HandlerInterceptor {
 
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+        // 预检 OPTIONS 不带令牌，放行交给跨域处理短路返回；
+        // 否则开启建连鉴权后，浏览器跨域订阅会在预检阶段就被 401 挡掉
+        if (CorsUtils.isPreFlightRequest(request)) {
+            return true;
+        }
         if (!properties.isConnectAuthEnabled()) {
             return true;
         }
